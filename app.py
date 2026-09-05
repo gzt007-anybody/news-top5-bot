@@ -32,15 +32,17 @@ def get_naver_news():
 
     client_secret = st.secrets["NAVER_CLIENT_SECRET"]
 
-    url = "https://openapi.naver.com/v1/search/news.json"
+    url = "https://naverapihub.apigw.ntruss.com/search/v1/news"
 
     headers = {
 
-        "X-Naver-Client-Id": client_id,
+        "X-NCP-APIGW-API-KEY-ID": st.secrets["NAVER_CLIENT_ID"],
 
-        "X-Naver-Client-Secret": client_secret
+        "X-NCP-APIGW-API-KEY": st.secrets["NAVER_CLIENT_SECRET"],
 
     }
+
+    
 
     params = {
 
