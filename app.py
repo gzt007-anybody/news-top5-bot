@@ -1,6 +1,8 @@
 import streamlit as st
 import requests
 import html
+import re
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 
@@ -413,3 +415,168 @@ if "news_list" in st.session_state:
                     )
 
                 st.divider()
+
+
+# Weekly search interest among candidates found in recent news headlines.
+TITLE_TOKEN = re.compile(r"[가-힣A-Za-z0-9]+")
+STOP_WORDS = set(
+    "뉴스 속보 단독 종합 포토 영상 기자 오늘 내일 어제 이번 지난 최근 관련 발표 "
+    "공개 진행 예정 개최 시작 완료 지원 확대 강화 올해 내년 한국 국내 세계 통해 "
+    "대해 대한 위해 함께 다시 정부 사람 소식 상황 문제 결과 처음 가장 이후 이상 "
+    "오전 오후 시 분 년 월 일 말 했다 한다 됐다 된다 있는 없는 하는 위한".split()
+)
+TREND_BATCH_SIZE = 5
+MIN_HEADLINE_COUNT = 2
+
+
+def headline_candidates(articles):
+    counts = Counter()
+    related = {}
+    for article in articles:
+        title = clean_text(article.get("title", ""))
+        tokens = TITLE_TOKEN.findall(re.sub(r"\[[^\]]*\]", " ", title))
+        seen = set()
+        for index, token in enumerate(tokens):
+            if token in STOP_WORDS or len(token) < 2 or token.isdecimal():
+                continue
+            seen.add(token.casefold())
+            if index + 1 < len(tokens):
+                following = tokens[index + 1]
+                if following not in STOP_WORDS and len(following) >= 2 and not following.isdecimal():
+                    seen.add(f"{token} {following}".casefold())
+        counts.update(seen)
+        link = (article.get("originallink") or article.get("link") or "").strip()
+        if link.startswith(("https://", "http://")):
+            for keyword in seen:
+                related.setdefault(keyword, link)
+
+    ranked = sorted(counts, key=lambda term: (-counts[term], -len(term.split()), term))
+    return [
+        (term, counts[term], related.get(term, ""))
+        for term in ranked
+        if counts[term] >= MIN_HEADLINE_COUNT
+    ][:40]
+
+
+def fetch_search_trends(keywords, start, end):
+    headers = {
+        "X-NCP-APIGW-API-KEY-ID": str(st.secrets["NAVER_CLIENT_ID"]).strip(),
+        "X-NCP-APIGW-API-KEY": str(st.secrets["NAVER_CLIENT_SECRET"]).strip(),
+    }
+    response = requests.post(
+        "https://naverapihub.apigw.ntruss.com/search-trend/v1/search",
+        headers=headers,
+        json={
+            "startDate": start.isoformat(),
+            "endDate": end.isoformat(),
+            "timeUnit": "date",
+            "keywordGroups": [{"groupName": term, "keywords": [term]} for term in keywords],
+        },
+        timeout=15,
+    )
+    response.raise_for_status()
+    return response.json()["results"]
+
+
+def compare_trend(points, start):
+    ratios = {point["period"]: point["ratio"] for point in points}
+    days = [(start + timedelta(days=offset)).isoformat() for offset in range(14)]
+    if any(day not in ratios for day in days):
+        return None
+    previous = sum(ratios[day] for day in days[:7])
+    recent = sum(ratios[day] for day in days[7:])
+    if recent <= previous:
+        return None
+    return (recent / previous - 1) * 100 if previous > 0 else float("inf")
+
+
+def weekly_ranking(candidates, start, end):
+    ranking = []
+    new_activity = []
+    incomplete = 0
+    for offset in range(0, len(candidates), TREND_BATCH_SIZE):
+        batch = candidates[offset:offset + TREND_BATCH_SIZE]
+        results = fetch_search_trends([term for term, _, _ in batch], start, end)
+        by_term = {result["title"]: result["data"] for result in results}
+        for term, count, link in batch:
+            points = by_term.get(term, [])
+            if len({point["period"] for point in points}) < 14:
+                incomplete += 1
+                continue
+            growth = compare_trend(points, start)
+            if growth == float("inf"):
+                new_activity.append(term)
+            elif growth is not None:
+                ranking.append((term, growth, count, link))
+    ranking.sort(key=lambda row: (-row[1], -row[2], row[0]))
+    return ranking[:20], new_activity, incomplete
+
+
+st.divider()
+st.subheader("최근 7일 급상승 키워드")
+trend_end = today - timedelta(days=1)
+trend_recent_start = trend_end - timedelta(days=6)
+trend_start = trend_recent_start - timedelta(days=7)
+st.caption(
+    f"어제까지 7일({trend_recent_start} ~ {trend_end})을 직전 7일과 비교합니다. "
+    "선택한 검색 조건의 기사 제목에서 2건 이상 나온 후보를 최대 40개 비교합니다."
+)
+
+if st.button("급상승 키워드 조회", key="weekly_trend"):
+    st.session_state.pop("weekly_trend_result", None)
+    if not query.strip():
+        st.warning("주제를 선택하거나 검색어를 입력해 주세요.")
+    else:
+        with st.spinner("최근 기사와 네이버 검색 관심도를 조회하고 있습니다..."):
+            articles = collect_news(query, trend_recent_start, trend_end, wanted_count=200)
+            candidates = headline_candidates(articles)
+            if not candidates:
+                st.info("비교할 키워드 후보가 부족합니다. 다른 주제나 검색어로 조회해 보세요.")
+            else:
+                try:
+                    ranking, new_activity, incomplete = weekly_ranking(candidates, trend_start, trend_end)
+                except requests.HTTPError as error:
+                    status = error.response.status_code
+                    if status in (401, 403):
+                        st.error("NAVER API HUB에서 현재 Application의 검색어 트렌드 권한을 확인해 주세요.")
+                    elif status == 429:
+                        st.error("검색어 트렌드 API 호출 한도에 도달했습니다. 잠시 후 다시 시도해 주세요.")
+                    else:
+                        st.error(f"검색어 트렌드 API 요청이 실패했습니다. (HTTP {status})")
+                except requests.RequestException:
+                    st.error("검색어 트렌드 API에 연결하지 못했습니다. 잠시 후 다시 시도해 주세요.")
+                except (KeyError, ValueError, TypeError):
+                    st.error("Streamlit Secrets 또는 검색어 트렌드 API 응답을 확인해 주세요.")
+                else:
+                    st.session_state["weekly_trend_result"] = (
+                        query, trend_end, len(articles), len(candidates), ranking, new_activity, incomplete
+                    )
+
+trend_result = st.session_state.get("weekly_trend_result")
+if trend_result and trend_result[:2] == (query, trend_end):
+    _, _, article_count, candidate_count, ranking, new_activity, incomplete = trend_result
+    st.caption(
+        f"검색어: {query} · 기사 {article_count}건 · 후보 {candidate_count}개 · "
+        "기사에서 발굴한 후보의 검색 관심도 상승률 순위"
+    )
+    if ranking:
+        st.dataframe(
+            [
+                {
+                    "순위": rank,
+                    "키워드": term,
+                    "검색 관심도 상승률": f"+{growth:,.1f}%",
+                    "제목 등장 기사 수": count,
+                    "관련 기사": link,
+                }
+                for rank, (term, growth, count, link) in enumerate(ranking, start=1)
+            ],
+            hide_index=True,
+            column_config={"관련 기사": st.column_config.LinkColumn("관련 기사")},
+        )
+    else:
+        st.info("두 기간을 비교해 상승률을 계산할 수 있는 상승 키워드가 없습니다.")
+    if new_activity:
+        st.caption("직전 7일 지수가 0인 후보 · " + ", ".join(new_activity))
+    if incomplete:
+        st.caption(f"14일치 지수가 모두 제공되지 않은 후보 {incomplete}개는 비교에서 제외했습니다.")
